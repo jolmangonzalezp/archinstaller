@@ -1,0 +1,197 @@
+#!/bin/sh
+
+efi=""
+root_partition=""
+cript_partition=""
+swap_partition=""
+swap_size=""
+locale=""
+timezone=""
+
+function get_timezone_locale() {
+    locale=$(curl -s https://ipapi.co/languages | cut -d',' -f1)
+    timezone=$(curl -s https://ipapi.co/timezone)
+}
+
+function forward() {
+    echo "Presiona Enter para continuar..."
+    read -r
+    clear
+}
+
+function set_locale_language() {
+    echo "Configurando el teclado y el idioma..."
+    sed -i "s/#${locale}.UTF-8/${locale}.UTF-8/g" /etc/locale.gen
+    locale-gen
+    export LANG="${locale}.UTF-8"
+    ln -sf "/usr/share/zoneinfo/${timezone}" /etc/localtime
+    hwclock --systohc
+    echo "Configuración regional y de teclado aplicada correctamente."
+    forward
+    connect_to_internet
+}
+
+function unblock_rfkill() {
+    rfkill list | grep -q "Soft blocked: yes" && rfkill unblock all
+    echo "Dispositivos de red desbloqueados si estaban bloqueados."
+}
+
+function connect_to_internet() {
+    if ping -c 1 8.8.8.8 &>/dev/null; then
+        echo "Conexión a Internet detectada."
+    else
+        desbloquear_rfkill
+        echo "No se detectó conexión a Internet. Iniciando configuración manual con iwctl..."
+        iwctl
+    fi
+    timedatectl set-ntp true
+    forward
+    disk_partitioning
+}
+
+function disk_partitioning() {
+    echo "Detectando discos disponibles..."
+    lsblk -dno NAME,SIZE
+    read -p "Selecciona el disco para particionar (ej. sda, nvme0n1): " disk_name
+    
+    ram_size=$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo)  # Convertir a entero
+if (( ram_size > 8192 )); then
+    swap_size=$(( ram_size / 2 ))
+elif (( ram_size <= 8192 )); then
+    swap_size=$(( ram_size ))
+else
+    swap_size=$(( ram_size * 2 ))
+fi
+    
+    echo "Particionando el disco /dev/${disk_name}..."
+    (
+        echo "g";
+        echo "n"; echo "1"; echo ""; echo "+512M"; echo "t"; echo "1"; # EFI
+        echo "n"; echo "2"; echo ""; echo "-${swap_size}M"; # Root
+        echo "n"; echo "3"; echo ""; echo ""; # Swap
+        echo "w";
+    ) | fdisk "/dev/${disk_name}"
+    
+    if [[ "$disk_name" == "nvme"* ]]; then
+        efi="/dev/${disk_name}p1"
+        root_partition="/dev/${disk_name}p2"
+        swap_partition="/dev/${disk_name}p3"
+    else
+        efi="/dev/${disk_name}1"
+        root_partition="/dev/${disk_name}2"
+        swap_partition="/dev/${disk_name}3"
+    fi
+    
+    echo "Particiones creadas correctamente:"
+    lsblk "/dev/${disk_name}"
+    forward
+    disk_formating
+}
+
+function disk_formating() {
+    echo "Formateando particiones..."
+    mkfs.fat -F32 "$efi"
+    mkswap "$swap_partition"
+    swapon "$swap_partition"
+    forward
+    encryption
+}
+
+function encryption() {
+    echo "Configurando encriptación en la partición raíz..."
+    cryptsetup luksFormat "$root_partition"
+    cryptsetup open "$root_partition" root
+    crypt_partition="/dev/mapper/root"
+    forward
+    btrfs_setup
+}
+
+function btrfs_setup() {
+    echo "Formateando partición raíz como Btrfs..."
+    mkfs.btrfs "$crypt_partition"
+    mount "$crypt_partition" /mnt
+    btrfs subvolume create /mnt/@
+    btrfs subvolume create /mnt/@home
+    btrfs subvolume create /mnt/@snapshots
+    btrfs subvolume create /mnt/@var_log
+    umount /mnt
+    
+    echo "Montando subvolúmenes..."
+    mount -o noatime,compress=zstd,space_cache=v2,subvol=@ "$crypt_partition" /mnt
+    mkdir -p /mnt/{boot,home,.snapshots,var/log}
+    mount -o noatime,compress=zstd,space_cache=v2,subvol=@home "$crypt_partition" /mnt/home
+    mount -o noatime,compress=zstd,space_cache=v2,subvol=@snapshots "$crypt_partition" /mnt/.snapshots
+    mount -o noatime,compress=zstd,space_cache=v2,subvol=@var_log "$crypt_partition" /mnt/var/log
+    mount "$efi" /mnt/boot
+    forward
+    base_installation
+}
+
+function base_installation() {
+    echo "Instalando el sistema base..."
+    packages="base base-devel linux-zen linux-zen-headers linux-firmware btrfs-progs efibootmgr grub grub-btrfs os-prober networkmanager openssh sudo dhcpcd zsh zsh-completions vim git curl wget man-db man-pages dosfstools e2fsprogs exfat-utils ntfs-3g smartmontools dialog man-db man-pages texinfo pacman-contrib snapper xdg-user-dirs xdg-utils tlp reflector neofetch inotify-tools pipewire pipewire-alsa pipewire-pulse pipewire-jack zsh-autosuggestions zsh-syntax-highlighting net-tools ifplugd iw wireless_tools wpa_supplicant dialog wireless-regdb bluez bluez-cups bluez-utils"
+
+    if [[ $(lscpu | grep "Model name" | awk '{print $3}') == "AMD" ]]; then
+        pacstrap -K /mnt $packages amd-ucode
+    else
+        pacstrap -K /mnt $packages intel-ucode
+    fi
+
+    forward
+    generate_fstab
+}
+
+
+function generate_fstab() {
+    echo "Generando fstab..."
+    genfstab -U /mnt >> /mnt/etc/fstab
+    echo "Archivo fstab generado correctamente."
+    forward
+    system_setup
+}
+
+function system_setup() {
+    echo "Entrando al sistema para configuración final..."
+    arch-chroot /mnt ln -sf /usr/share/zoneinfo/$timezone /etc/localtime
+    arch-chroot /mnt hwclock --systohc
+    arch-chroot /mnt echo "$locale.UTF-8 UTF-8" > /etc/locale.gen
+    arch-chroot /mnt locale-gen
+    arch-chroot /mnt echo "LANG=$locale.UTF-8" > /etc/locale.conf
+    arch-chroot /mnt echo "KEYMAP=la-latin1" > /etc/vconsole.conf
+    arch-chroot /mnt echo "$hostname" > /etc/hostname
+    arch-chroot /mnt echo -e "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\t$hostname.localdomain\t$hostname" > /etc/hosts
+    arch-chroot /mnt passwd
+    arch-chroot /mnt sed -i 's/MODULES=()/MODULES=(btrfs)/' /etc/mkinitcpio.conf
+    arch-chroot /mnt sed -i "s/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt filesystems fsck)/" /etc/mkinitcpio.conf
+    arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB 
+    uuid=$(blkid $root_partition | awk -F '"' '{print $2}')
+    # arch-chroot /mnt sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet root='"${crypt_partition}"' cryptdevice=UUID='"${uuid}"':'"$(basename $crypt_partition)"' "|g' /etc/default/grub
+    arch-chroot /mnt sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet cryptdevice=UUID='"${uuid}"':root root=/dev/mapper/root"|g' /etc/default/grub
+
+    arch-chroot /mnt sed -i 's/#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
+    arch-chroot /mnt mkinitcpio -P
+    arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+    echo "Instalación completada."
+    forward
+    enable_services
+}
+
+function enable_services() {
+    echo "Habilitando servicios..."
+    services=("systemd-networkd" "systemd-timesyncd" "systemd-resolved" "NetworkManager.service" "fstrim.timer" "sshd" "paccache.timer")
+    for service in "${services[@]}"; do
+        arch-chroot /mnt systemctl enable $service
+    done
+    forward
+    rebooting
+}
+
+function rebooting() {
+    echo "El sistema se ha instalado correctamente. Puedes reiniciar ahora."
+    umount -R /mnt
+    forward
+    reboot
+}
+
+get_timezone_locale
+set_locale_language
