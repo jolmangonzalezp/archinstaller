@@ -1,0 +1,2 @@
+# archinstaller
+Installer for Archlinux
